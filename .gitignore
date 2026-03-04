@@ -1,0 +1,7 @@
+/.lake
+
+*.o
+*.so
+*.leanpkg
+*.olean
+*~

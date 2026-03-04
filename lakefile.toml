@@ -1,0 +1,10 @@
+name = "lean-pari"
+version = "0.1.0"
+
+[[lean_lib]]
+name = "LeanPari"
+
+[[lean_exe]]
+name = "Main"
+root = "Main"
+moreLinkArgs = ["-lpari", "-lm", "-L/home/iwao/lib", "-Wl,-rpath,/home/iwao/lib", "c/pari_lean.o"]
