@@ -9,12 +9,17 @@ CFLAGS = -O2 -fPIC -I$(PARI_INCLUDE) -I$(LEAN_INCLUDE)
 
 .PHONY: all clean
 
-all: c/pari_lean.o
+C_OBJS = c/pari_lean.o c/pari_ell_lean.o
+
+all: $(C_OBJS)
 	lake build
 
-c/pari_lean.o: c/pari_lean.c
+c/pari_lean.o: c/pari_lean.c c/pari_lean_internal.h
+	gcc $(CFLAGS) -c $< -o $@ $(LDFLAGS)
+
+c/pari_ell_lean.o: c/pari_ell_lean.c c/pari_lean_internal.h
 	gcc $(CFLAGS) -c $< -o $@ $(LDFLAGS)
 
 clean:
-	rm -f c/pari_lean.o
+	rm -f $(C_OBJS)
 	lake clean
