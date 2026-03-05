@@ -10,119 +10,184 @@ PARI の `bnf` が保持する各フィールドを，以下の基準で Lean 4 
 
 | フィールド | 型の選択 | 理由 |
 |---|---|---|
-| 次数・符号数 `(r1,r2)` | `Nat`, `Nat × Nat` | 常に小さい整数 |
-| 定義多項式 `T(X)` | `Polynomial ℚ` | Mathlib4 の型をそのまま保持，小形式等の証明に直接利用できる |
-| 判別式 `disc` | `Int` | 大きくなりうるが，Leanの任意精度 `Int` で対応 |
-| 類数 `h` | `Int` | 同上（岩澤理論では p-部分の演算が必要） |
-| 類群不変量 `cyc` | `Array Nat` | SNF の各因子は個別に参照したい |
-| 整基底・多項式・単数 | `PariGEN` | PARI内でさらに計算に使う複合オブジェクト |
-| 調整子 `reg` | `PariGEN` | 精度依存の実数 |
-| bnf 全体 | `PariGEN` (`raw`) | `bnrisprincipal` 等への引き渡し用 |
+| 数体 K | `(K : Type*) [Field K] [NumberField K]` | Mathlib4 の `NumberField` typeclass をバックボーンとして使用 |
+| 次数 `[K:ℚ]`・符号数 `(r₁,r₂)` | Mathlib4 インスタンスから導出 | `FiniteDimensional.finrank ℚ K`・`nrRealPlaces K`・`nrComplexPlaces K` を再利用（フィールドとして格納不要） |
+| 定義多項式 `T(X)` | `Polynomial ℚ` | Mathlib4 の型をそのまま保持，`Irreducible T` 等の証明に直接利用 |
+| 判別式 `disc` | `Int` | PARI が計算，任意精度 `Int` として保持 |
+| イデアル類群 `Cl(K)` | `ClassGroup (RingOfIntegers K)` + SNF 同型 | Mathlib4 の `ClassGroup`（`Mathlib.RingTheory.ClassGroup`）；SNF 同型は `∀ i : Fin k, Fin (cyc[i])`（`Mathlib.Algebra.Group.Fin`） |
+| 類群不変因子 `[n₁,...,nₖ]` | `Array Nat` | SNF の各因子は個別に参照したい |
+| 単数群 `𝒪_K^×` | `ZMod tuOrder × FreeAbelianGroup (Fin r)` | Dirichlet の単数定理を Mathlib4 の `FreeAbelianGroup`（`Mathlib.Algebra.FreeAbelianGroup`）で型付け |
+| 整基底・単数系 | `GEN` | PARI 内でさらに計算に使う複合オブジェクト |
+| 単数規準 `reg` | `GEN` | 精度依存の実数 |
+| bnf 全体 | `GEN` (`raw`) | `bnrisprincipal` 等への引き渡し用 |
 
 
 
 ## 型階層の定義
 
 ```lean
--- LeanPari/NumberField.lean
+-- LeanPari/NumberField.lean（Mathlib4 統合版）
 import LeanPari.Basic
-import Mathlib.Algebra.Polynomial.Basic  -- Polynomial ℚ を使用
+import Mathlib.NumberTheory.NumberField.Basic       -- NumberField K, RingOfIntegers K
+import Mathlib.NumberTheory.NumberField.Embeddings  -- nrRealPlaces, nrComplexPlaces
+import Mathlib.RingTheory.ClassGroup                -- ClassGroup (RingOfIntegers K)
+import Mathlib.Algebra.Group.Fin                    -- Fin n の加法群構造（類群 SNF 同型の共域に使用）
+import Mathlib.Algebra.FreeAbelianGroup             -- FreeAbelianGroup（単数群の自由部分）
+import Mathlib.Data.ZMod.Basic                      -- ZMod n（単数群の捩れ部分）
 
-open Polynomial
+open Polynomial NumberField
 
 namespace LeanPari
 
 /-!
-  ## 層 1: 数体 (nfinit の出力に対応)
+  ## 層 1: LeanPari 数体構造体（nfinit の出力に対応）
 
-  K = Q[X]/(T) の基本算術データ
+  型パラメータ K に Mathlib4 の `NumberField` インスタンスを持たせる．
+  K = ℚ[X]/(T) に対応する具体的な型（例: `AdjoinRoot (X^2+23 : Polynomial ℚ)`）であり，
+  LeanPari 構造体は PARI 計算結果を Mathlib の型に付加したものとして設計する．
+
+  次数・符号数・単数群の階数は `K` の Mathlib4 インスタンスから
+  `FiniteDimensional.finrank ℚ K`・`nrRealPlaces K`・`nrComplexPlaces K` として直接導出し，
+  フィールドとして格納しない（PARI 計算値との整合性チェックに利用できる）．
 -/
-structure NumberField where
-  /-- 定義多項式 T(X)：Mathlib4 の `Polynomial ℚ` として保持，小形式判定等の証明に直接利用できる -/
-  pol       : Polynomial ℚ
-  /-- [K : Q] -/
-  degree    : Nat
-  /-- 実埋め込みの個数 r₁，複素埋め込み対の個数 r₂ -/
-  r1        : Nat
-  r2        : Nat
-  /-- 判別式 disc(K/Q)．任意精度整数として保持 -/
-  disc      : Int
-  /-- [O_K : Z[α]]（指数）-/
-  index     : Nat
-  /-- 整基底 {ω₁,...,ωₙ} -/
-  zk        : GEN
-  /-- nfinit の生の GEN オブジェクト（さらなる計算用）-/
-  nfRaw     : GEN
+structure LPNumberField (K : Type*) [Field K] [NumberField K] where
+  /-- 定義多項式 T(X)：Mathlib4 の `Polynomial ℚ`
+      `Irreducible T`・`T.natDegree = FiniteDimensional.finrank ℚ K` 等の証明に直接利用できる -/
+  pol   : Polynomial ℚ
+  /-- PARI が計算した整基底（Hermite 正規形，nfinit の zk フィールド） -/
+  zk    : GEN
+  /-- 判別式 disc(K/ℚ)（PARI が計算，任意精度整数として保持） -/
+  disc  : Int
+  /-- nfinit の生の GEN オブジェクト（bnfinit 等にそのまま渡す） -/
+  nfRaw : GEN
+
+namespace LPNumberField
+
+/-- [K : ℚ] を Mathlib4 のインスタンスから導出（PARI 計算値との整合性チェックに利用可能） -/
+noncomputable def degree (K : Type*) [Field K] [NumberField K] : ℕ :=
+  FiniteDimensional.finrank ℚ K
+
+/-- 実埋め込みの個数 r₁（Mathlib4 の `NumberField.nrRealPlaces` を使用） -/
+noncomputable def nrRealPlaces (K : Type*) [Field K] [NumberField K] : ℕ :=
+  NumberField.nrRealPlaces K
+
+/-- 複素埋め込み対の個数 r₂（Mathlib4 の `NumberField.nrComplexPlaces` を使用） -/
+noncomputable def nrComplexPlaces (K : Type*) [Field K] [NumberField K] : ℕ :=
+  NumberField.nrComplexPlaces K
+
+end LPNumberField
 
 /-!
-  ## 層 2: 類群 (bnf.clgp に対応)
+  ## 層 2: LeanPari 類群構造体（bnf.clgp に対応）
 
-  Cl(K) ≅ ℤ/n₁ℤ × ... × ℤ/nₖℤ（n₁ | n₂ | ... | nₖ, Smith 標準形）
+  Mathlib4 の `ClassGroup (RingOfIntegers K)` を核に，
+  PARI が計算した SNF 分解データを付加する．
+
+  類群の Smith 標準形定理：
+    Cl(K) ≅ ℤ/n₁ℤ × ... × ℤ/nₖℤ  (n₁ | n₂ | ... | nₖ)
+
+  この同型は `ClassGroup (RingOfIntegers K) ≃+ ∀ i : Fin k, Fin (cyc[i])` で型付けする．
+  `Mathlib.Algebra.Group.Fin` が `Fin n` に加法群構造 `Fin.addCommGroup` を与えるため
+  `Fin (cyc[i])` は位数 `cyc[i]` の巡回群として使える．
+
+  同型写像 `isoSNF` は `BNFCertification` が `Unconditional` のときのみ Lean 内証明が付く．
 -/
-structure ClassGroup where
-  /-- 類数 h = n₁ · n₂ · ... · nₖ -/
+structure LPClassGroup (K : Type*) [Field K] [NumberField K] where
+  /-- 類数 h = ∏ nᵢ（任意精度整数） -/
   classNumber : Int
-  /-- SNF の不変因子列 [n₁, ..., nₖ]（n_i | n_{i+1}）-/
+  /-- SNF の不変因子列 [n₁,...,nₖ]（n_i | n_{i+1}）-/
   invariants  : Array Nat
-  /-- 類群の生成元（イデアル）リスト -/
+  /-- 類群の生成元（イデアル）リスト（PARI GEN） -/
   generators  : GEN
+  /-- SNF 同型の証拠（オプション）：
+      ClassGroup (RingOfIntegers K) ≃+ ∀ i : Fin invariants.size, Fin (invariants[i]!)
+      ここで `Fin (invariants[i]!)` は `Mathlib.Algebra.Group.Fin` の加法群構造を持つ．
+      この証明が付いている場合のみ Lean カーネルが検証したことになる -/
+  isoSNF : Option (ClassGroup (RingOfIntegers K) ≃+
+              ∀ i : Fin invariants.size, Fin (invariants[i]!)) := none
 
-namespace ClassGroup
+namespace LPClassGroup
 
-/-- 類群の階数（自明でない因子の個数）-/
-def rank (cg : ClassGroup) : Nat :=
+def rank {K : Type*} [Field K] [NumberField K] (cg : LPClassGroup K) : Nat :=
   cg.invariants.filter (· > 1) |>.size
 
-/-- p-Sylow 部分群の不変因子列（岩澤理論用）
-    Cl(K)[p^∞] ≅ ⊕ ℤ/p^{vₚ(nᵢ)}ℤ -/
-def pPrimaryInvariants (cg : ClassGroup) (p : Nat) : Array Nat :=
+/-- Cl(K)[p^∞] の不変因子列（岩澤 μ-不変量・λ-不変量計算の基盤） -/
+def pPrimaryInvariants {K : Type*} [Field K] [NumberField K]
+    (cg : LPClassGroup K) (p : Nat) : Array Nat :=
   cg.invariants.map (fun n =>
-    -- n の p-power part を計算
-    let rec pPow (m : Nat) : Nat :=
-      if m % p == 0 then pPow (m / p) * p else 1
+    let rec pPow : Nat → Nat
+      | m => if m % p == 0 then pPow (m / p) * p else 1
     termination_by m
     pPow n)
   |>.filter (· > 1)
 
-/-- p-rank: Cl(K)[p] の ℤ/pℤ 上の次元 -/
-def pRank (cg : ClassGroup) (p : Nat) : Nat :=
+/-- p-rank: Cl(K)[p] の ℤ/pℤ-次元 -/
+def pRank {K : Type*} [Field K] [NumberField K]
+    (cg : LPClassGroup K) (p : Nat) : Nat :=
   cg.invariants.filter (fun n => n % p == 0) |>.size
 
-end ClassGroup
+end LPClassGroup
 
 /-!
-  ## 層 3: Buchmann 数体 (bnfinit の出力に対応)
+  ## 層 2': LeanPari 単数群構造体
+
+  Dirichlet の単数定理（Mathlib4: `NumberField.Units.rank`）による分解：
+    (RingOfIntegers K)ˣ ≅ ZMod tuOrder × FreeAbelianGroup (Fin r)
+  ここで r = nrRealPlaces K + nrComplexPlaces K - 1．
+
+  - 捩れ部分：`ZMod tuOrder`（`Mathlib.Data.ZMod.Basic`）
+  - 自由部分：`FreeAbelianGroup (Fin r)`（`Mathlib.Algebra.FreeAbelianGroup`）
+
+  PARI の bnfinit が返す基本単数系 {u₁,...,u_r} は `fu` に PARI GEN として保持し，
+  Lean 型での表現との対応は `isoDir` に同型写像（オプション）として記録する．
 -/
-structure BNF where
-  /-- 数体の基本データ -/
-  nf          : NumberField
-  /-- イデアル類群 -/
-  clgp        : ClassGroup
-  /-- 単数群の捩れ部分の位数 -/
-  tuOrder     : Nat
-  /-- 原始的捩れ単数（根の単数 ζ）-/
-  tuGen       : GEN
-  /-- 基本単数系 {u₁,...,u_{r₁+r₂-1}} -/
-  fu          : GEN
-  /-- 調整子 Reg(K)（精度依存実数）-/
-  regulator   : GEN
-  /-- bnfinit の生の GEN オブジェクト（bnrisprincipal 等に直接渡す）-/
-  bnfRaw      : GEN
+structure LPUnitGroup (K : Type*) [Field K] [NumberField K] where
+  /-- 捩れ部分の位数（根の単数の個数 w）-/
+  tuOrder : Nat
+  /-- 原始的根の単数 ζ_w（PARI GEN） -/
+  tuGen   : GEN
+  /-- 基本単数系 {u₁,...,u_r}（PARI GEN リスト） -/
+  fu      : GEN
+  /-- Dirichlet 単数定理による同型（オプション）：
+      (RingOfIntegers K)ˣ ≃* ZMod tuOrder × FreeAbelianGroup (Fin r)
+      r = nrRealPlaces K + nrComplexPlaces K - 1
+      BNFCertification が Unconditional のときのみ Lean 内証明が付く -/
+  isoDir : Option ((RingOfIntegers K)ˣ ≃*
+              (ZMod tuOrder ×
+               FreeAbelianGroup (Fin (NumberField.nrRealPlaces K +
+                                      NumberField.nrComplexPlaces K - 1)))) := none
+
+/-!
+  ## 層 3: LeanPari Buchmann 数体構造体（bnfinit の出力に対応）
+
+  型パラメータ K に Mathlib4 の `NumberField` インスタンスを持たせることで，
+  Mathlib の定理（類体論・岩澤理論・Dirichlet の単数定理等）を
+  型レベルで BNF 計算結果に直接結びつけることができる．
+-/
+structure BNF (K : Type*) [Field K] [NumberField K] where
+  /-- 数体の基本データ（Mathlib4 の NumberField K をバックボーンに持つ） -/
+  nf        : LPNumberField K
+  /-- イデアル類群（ClassGroup (RingOfIntegers K) を核，SNF 同型をオプションで保持） -/
+  clgp      : LPClassGroup K
+  /-- 単数群（ZMod × FreeAbelianGroup の Dirichlet 分解を型で記録） -/
+  units     : LPUnitGroup K
+  /-- 単数規準 Reg(K)（精度依存実数，PARI GEN） -/
+  regulator : GEN
+  /-- bnfinit の生の GEN（bnrisprincipal 等に直接渡す） -/
+  bnfRaw    : GEN
 
 namespace BNF
 
-/-- 類数の取得 -/
-def classNumber (b : BNF) : Int := b.clgp.classNumber
+def classNumber {K : Type*} [Field K] [NumberField K] (b : BNF K) : Int :=
+  b.clgp.classNumber
 
-/-- 符号数 (r₁, r₂) -/
-def signature (b : BNF) : Nat × Nat := (b.nf.r1, b.nf.r2)
-
-/-- 単数群の階数 r₁ + r₂ - 1 -/
-def unitRank (b : BNF) : Nat := b.nf.r1 + b.nf.r2 - 1
+/-- 単数群の自由部分の階数 r₁+r₂-1（Mathlib4 のインスタンスから導出） -/
+noncomputable def unitRank (K : Type*) [Field K] [NumberField K] : Nat :=
+  NumberField.nrRealPlaces K + NumberField.nrComplexPlaces K - 1
 
 /-- 虚二次体か否か -/
-def isImaginaryQuadratic (b : BNF) : Bool :=
-  b.nf.degree == 2 && b.nf.r1 == 0 && b.nf.r2 == 1
+noncomputable def isImaginaryQuadratic (K : Type*) [Field K] [NumberField K] : Bool :=
+  LPNumberField.degree K == 2 && NumberField.nrRealPlaces K == 0
 
 end BNF
 
@@ -391,18 +456,18 @@ opaque pariBNFGetPol    (nf  : @& GEN) : IO GEN
 opaque pariBNFinitCoeffs (coeffs : @& GEN) : IO GEN
 
 /-- `Polynomial ℚ` を受け取る BNF スマートコンストラクタ
-    Mathlib の型をそのまま受け取るので，小形式判定等の証明の内容と完全に整合する -/
-def BNF.init (poly : Polynomial ℚ) : IO BNF := do
+    Mathlib の型をそのまま受け取るので，小形式判定等の証明の内容と完全に整合する
+    K は呼び出し元が `[NumberField K]` インスタンスとして指定する -/
+def BNF.init (K : Type*) [Field K] [NumberField K]
+    (poly : Polynomial ℚ) : IO (BNF K) := do
   let mark    ← stackMark
   -- Polynomial ℚ → List ℚ → t_VEC → gtopoly → bnfinit
   -- listRatToGen は Conv.lean に追加：各 q : ℚ を readStr s!"{q.num}/{q.den}" で PARI t_FRAC に変換
   let coeffsG ← listRatToGen (polyToCoeffList poly)
   let bnfRaw  ← pariBNFinitCoeffs coeffsG
 
-  -- nf 部分を抽出
+  -- nf 部分を抽出（次数・符号数は K の Mathlib4 インスタンスから導出するため抽出不要）
   let nfRaw    ← pariBNFGetNF bnfRaw
-  let deg      ← pariNFDegree nfRaw
-  let (r1, r2) ← pariNFSignature nfRaw
   let disc     ← pariNFDisc nfRaw     -- IO Int 直接取得（String.toInt? 不要）
   let zk       ← pariBNFGetZK nfRaw
 
@@ -420,20 +485,23 @@ def BNF.init (poly : Polynomial ℚ) : IO BNF := do
   stackRestore mark
   return {
     nf := {
-      pol := poly,      -- Mathlib の Polynomial ℚ をそのまま保持
-      degree := deg,
-      r1 := r1, r2 := r2,
-      disc := disc, index := 1,  -- 別途 nf.index で取得可
-      zk := zk, nfRaw := nfRaw
+      pol   := poly,   -- Mathlib の Polynomial ℚ をそのまま保持
+      disc  := disc,
+      zk    := zk,
+      nfRaw := nfRaw
     },
     clgp := {
       classNumber := h,
       invariants  := cyc,
       generators  := gens
     },
-    tuOrder := tuOrd, tuGen := tuGen,
-    fu := fu, regulator := reg,
-    bnfRaw := bnfRaw
+    units := {
+      tuOrder := tuOrd,
+      tuGen   := tuGen,
+      fu      := fu
+    },
+    regulator := reg,
+    bnfRaw    := bnfRaw
   }
 
 end LeanPari
@@ -448,33 +516,45 @@ Mathlib4 の `Polynomial ℚ` 記法で定義多項式を直接記述する．
 ```lean
 -- Main.lean での使用例
 
-import Mathlib.Algebra.Polynomial.Basic
-open Polynomial
+import Mathlib.NumberTheory.NumberField.Basic
+import Mathlib.RingTheory.AdjoinRoot
+open Polynomial NumberField
+
+-- 型パラメータとして使う数体型を定義
+-- AdjoinRoot により Mathlib4 が NumberField インスタンスを与える
+abbrev K₁ := AdjoinRoot (X ^ 2 + C 23 : Polynomial ℚ)
+-- instance : NumberField K₁ := ...  (Mathlib が提供)
+
+abbrev K₅ := AdjoinRoot (X ^ 4 + X ^ 3 + X ^ 2 + X + C 1 : Polynomial ℚ)
 
 def testBNF : IO Unit := do
   Pari.initializePari
 
-  -- Q(√-23)：定義多項式 X^2 + 23，類数 3，類群 ℤ/3ℤ
+  -- Q(√-23)：定義多項式 X²+23，類数 3，類群 ℤ/3ℤ
+  -- BNF K₁ 型として取得（K₁ の Mathlib4 NumberField インスタンスを利用）
   let T1 : Polynomial ℚ := X ^ 2 + C 23
-  let bnf ← BNF.init T1
+  let bnf : BNF K₁ ← BNF.init T1
 
-  IO.println s!"定義多項式次数   : {bnf.nf.degree}"
-  IO.println s!"符号数 (r1, r2)  : {bnf.nf.r1}, {bnf.nf.r2}"
-  IO.println s!"判別式           : {bnf.nf.disc}"
-  IO.println s!"類数             : {bnf.classNumber}"
-  IO.println s!"類群不変因子     : {bnf.clgp.invariants}"
-  IO.println s!"類群の階数       : {bnf.clgp.rank}"
-  IO.println s!"単数群の捩れ位数 : {bnf.tuOrder}"
-  IO.println s!"単数群の階数     : {bnf.unitRank}"
+  -- 次数・符号数は K₁ の Mathlib4 インスタンスから直接導出（フィールドアクセス不要）
+  IO.println s!"[K₁:ℚ]             : {LPNumberField.degree K₁}"        -- = 2
+  IO.println s!"実埋め込み r₁       : {NumberField.nrRealPlaces K₁}"    -- = 0
+  IO.println s!"複素埋め込み r₂     : {NumberField.nrComplexPlaces K₁}" -- = 1
+  -- 判別式・類群データは PARI 計算値
+  IO.println s!"判別式（PARI）      : {bnf.nf.disc}"
+  IO.println s!"類数                : {bnf.classNumber}"
+  IO.println s!"類群不変因子        : {bnf.clgp.invariants}"
+  IO.println s!"類群の階数          : {bnf.clgp.rank}"
+  IO.println s!"単数群の捩れ位数    : {bnf.units.tuOrder}"
+  IO.println s!"単数群の自由部分階数: {BNF.unitRank K₁}"
 
   -- 岩澤理論用：3-primary 部分
   let p : Nat := 3
-  IO.println s!"Cl(K)[3^∞] の不変因子: {bnf.clgp.pPrimaryInvariants p}"
+  IO.println s!"Cl(K₁)[3^∞] の不変因子: {bnf.clgp.pPrimaryInvariants p}"
   IO.println s!"3-rank : {bnf.clgp.pRank p}"
 
-  -- 次数 4 の例：Q(ζ₅)，山本円小式 X^4 + X^3 + X^2 + X + 1
+  -- 次数 4 の例：Q(ζ₅)，円分多項式 X⁴+X³+X²+X+1
   let T5 : Polynomial ℚ := X ^ 4 + X ^ 3 + X ^ 2 + X + 1
-  let bnf5 ← BNF.init T5
+  let bnf5 : BNF K₅ ← BNF.init T5
   IO.println s!"\nQ(ζ₅) の類数: {bnf5.classNumber}"
   IO.println s!"Q(ζ₅) の判別式: {bnf5.nf.disc}"
 ```
@@ -485,11 +565,13 @@ def testBNF : IO Unit := do
 
 研究上の文脈（岩澤理論・ $p$ 進 $L$ 函数・類体論）に向けた設計上のポイントを整理する： [kconrad.math.uconn](https://kconrad.math.uconn.edu/math5230f12/handouts/PARIalgnumthy.pdf)
 
-- **`ClassGroup.pPrimaryInvariants`** で Cl(K) の $p$-Sylow 部分群の構造を直接取得でき，岩澤 μ-不変量・λ-不変量の計算基盤になる．
+- 型パラメータ `K` に Mathlib4 の `NumberField K` インスタンスを持たせることで，次数・符号数・単数群の階数を `FiniteDimensional.finrank ℚ K`・`nrRealPlaces K`・`nrComplexPlaces K` として直接導出でき，PARI 計算値との整合性チェックが可能になる．
+- **`LPClassGroup.isoSNF`** に `ClassGroup (RingOfIntegers K) ≃+ ∀ i : Fin k, Fin (cyc[i])` の同型を記録することで，Mathlib4 の `ClassGroup` と PARI 計算結果を型レベルで結びつけることができる（`Mathlib.Algebra.Group.Fin`）．
+- **`LPUnitGroup.isoDir`** に `(RingOfIntegers K)ˣ ≃* ZMod w × FreeAbelianGroup (Fin r)` の同型を記録することで，Dirichlet の単数定理を型レベルで表現できる（`Mathlib.Algebra.FreeAbelianGroup`）．
+- **`LPClassGroup.pPrimaryInvariants`** で Cl(K) の $p$-Sylow 部分群の構造を直接取得でき，岩澤 μ-不変量・λ-不変量の計算基盤になる．
 - **`BNF.bnfRaw`** を保持することで，`bnrisprincipal`・`bnrinit`（ray class group）等のさらなる PARI 関数にそのまま渡せる． [pari.math.u-bordeaux](https://pari.math.u-bordeaux.fr/dochtml/html/General_number_fields.html)
 - 判別式・類数は Lean の `Int`（任意精度）にすることで，大きな体でも精度を落とさず扱える．
-- 定義多項式を `Polynomial ℚ`（Mathlib4）なまま `NumberField.pol` として保持することで，小形式判定（`Irreducible`）や階数計算等の Lean 内部証明がそのまま利用できる．
-- `NF ≤ BNF ≤ BNR` の型階層に対応して，将来 `BNR` 構造体を追加する際も `BNF` を `bnr.nf` フィールドとして持てばよく，拡張性がある．
+- `NF ≤ BNF ≤ BNR` の型階層に対応して，将来 `BNR (K : Type*) [NumberField K]` 構造体を追加する際も `BNF K` を `bnr.nf` フィールドとして持てばよく，拡張性がある．
 
 ## mathlibとの統合の検討
 
@@ -570,30 +652,28 @@ end LeanPari
 前回設計した `BNF` 構造体を修正する：
 
 ```lean
--- LeanPari/NumberField.lean（修正版）
+-- LeanPari/NumberField.lean（修正版，Mathlib4 統合）
 
-structure BNF where
-  nf         : NumberField
-  clgp       : ClassGroup
-  tuOrder    : Nat
-  tuGen      : PariGEN
-  fu         : PariGEN
-  regulator  : PariGEN
-  bnfRaw     : PariGEN
+structure BNF (K : Type*) [Field K] [NumberField K] where
+  nf          : LPNumberField K
+  clgp        : LPClassGroup K
+  units       : LPUnitGroup K
+  regulator   : GEN
+  bnfRaw      : GEN
   /-- この BNF の計算が依拠している仮定 -/
-  cert       : BNFCertification
+  cert        : BNFCertification
   /-- bnfinit に渡した技術的パラメータの記録 -/
-  bachConst  : Float    -- デフォルト 0.3，GRH 条件下では 12.0
-  searchBound : Nat     -- 実際に検査した素数の界
+  bachConst   : Float    -- デフォルト 0.3，GRH 条件下では 12.0
+  searchBound : Nat      -- 実際に検査した素数の界
 
 namespace BNF
 
 /-- 無条件の結果かどうか -/
-def isUnconditional (b : BNF) : Bool :=
+def isUnconditional {K : Type*} [Field K] [NumberField K] (b : BNF K) : Bool :=
   b.cert.isUnconditional
 
 /-- この計算結果を定理として使う際の前提条件を文字列で返す -/
-def assumptionStatement (b : BNF) : String :=
+def assumptionStatement {K : Type*} [Field K] [NumberField K] (b : BNF K) : String :=
   match b.cert with
   | .Heuristic c =>
     s!"[注意] この結果は GRH より強いヒューリスティック \
@@ -641,7 +721,7 @@ end Pari
 ## `BNF.init` の修正：3 種類のコンストラクタ
 
 引数を `String` から `Polynomial ℚ` に変更し，内部で `Conv.polyQQToGen` を呼んで
-PARI GEN に変換してから `bnfinit` に渡す：
+PARI GEN に変換してから `bnfinit` に渡す．型パラメータ `K` を受け取るよう変更する：
 
 ```lean
 -- LeanPari/BNF.lean（修正版）
@@ -649,36 +729,39 @@ PARI GEN に変換してから `bnfinit` に渡す：
 namespace LeanPari
 
 /-- デフォルト：ヒューリスティック（探索用）-/
-def BNF.initHeuristic (pol : Polynomial ℚ) : IO BNF := do
+def BNF.initHeuristic (K : Type*) [Field K] [NumberField K]
+    (pol : Polynomial ℚ) : IO (BNF K) := do
   let polGen ← Conv.polyQQToGen pol
   let bnfRaw ← withPariStack do
     bnfinit polGen          -- Pari.bnfinit : GEN → IO GEN（flag = 0 デフォルト）
-  let base ← BNF.extractFields bnfRaw
+  let base ← BNF.extractFields K bnfRaw
   return { base with
     cert       := .Heuristic 0.3
     bachConst  := 0.3 }
 
 /-- GRH 条件付き：Bach 定数を 12.0 に設定 -/
-def BNF.initGRH (pol : Polynomial ℚ) : IO BNF := do
+def BNF.initGRH (K : Type*) [Field K] [NumberField K]
+    (pol : Polynomial ℚ) : IO (BNF K) := do
   let polGen ← Conv.polyQQToGen pol
   -- technical パラメータで Bach 定数を 12 に設定
   let bnfRaw ← withPariStack do
     bnfinitWithBach polGen 12.0  -- Pari.bnfinitWithBach : GEN → Float → IO GEN
   let bound ← pariComputeBachBound bnfRaw  -- 12·log²|disc| を計算
-  let base ← BNF.extractFields bnfRaw
+  let base ← BNF.extractFields K bnfRaw
   return { base with
     cert       := .ConditionalOnGRH bound
     bachConst  := 12.0 }
 
 /-- 無条件：bnfcertify を呼ぶ（低次体のみ実用的）-/
-def BNF.initUnconditional (pol : Polynomial ℚ) : IO (Option BNF) := do
+def BNF.initUnconditional (K : Type*) [Field K] [NumberField K]
+    (pol : Polynomial ℚ) : IO (Option (BNF K)) := do
   let polGen ← Conv.polyQQToGen pol
   let bnfRaw ← withPariStack do
     bnfinitFull polGen      -- Pari.bnfinitFull : GEN → IO GEN（flag = 1，単数も計算）
   -- bnfcertify を実行
   let certResult ← pariCallBnfcertify bnfRaw
   if certResult == 1 then
-    let base ← BNF.extractFields bnfRaw
+    let base ← BNF.extractFields K bnfRaw
     return some { base with
       cert      := .Unconditional "bnfcertify: 1"
       bachConst := 0.0 }
@@ -714,21 +797,21 @@ opaque bnfinitFull (pol : @& GEN) : IO GEN
 前回提案した `BNFBridge` の整合性命題も，前提条件を明示する形に修正すべきである：
 
 ```lean
-structure BNFBridge (K : Type) [Field K] [NumberField K] where
-  bnf : BNF
+structure BNFBridge (K : Type*) [Field K] [NumberField K] where
+  bnf : BNF K
   /-- 無条件に成立する命題は Unconditional のみ -/
   classNumberEq :
     match bnf.cert with
     | .Unconditional _    =>
         -- Lean カーネルが検証可能
-        NumberField.classNumber K = bnf.clgp.classNumber.toNat
+        Fintype.card (ClassGroup (RingOfIntegers K)) = bnf.clgp.classNumber.toNat
     | .ConditionalOnGRH _ =>
         -- 定理の statement に GRH を仮定として明記
-        GRH → NumberField.classNumber K = bnf.clgp.classNumber.toNat
+        GRH → Fintype.card (ClassGroup (RingOfIntegers K)) = bnf.clgp.classNumber.toNat
     | .Heuristic _        =>
         -- 命題自体は立てられるが証明の根拠が弱い
         -- sorry か native_decide（計算的検証）で補う
-        NumberField.classNumber K = bnf.clgp.classNumber.toNat
+        Fintype.card (ClassGroup (RingOfIntegers K)) = bnf.clgp.classNumber.toNat
 ```
 
 ***
@@ -743,19 +826,19 @@ def checkQ_sqrt_neg23 : IO Unit := do
   -- 定義多項式を Lean の Polynomial ℚ として記述（文字列リテラル不使用）
   let f : Polynomial ℚ := X ^ 2 + C 23  -- ℚ[x] の x² + 23
 
-  -- 探索：ヒューリスティック
-  let bnfH ← BNF.initHeuristic f
+  -- 探索：ヒューリスティック（K₁ = AdjoinRoot f の NumberField インスタンスを使用）
+  let bnfH : BNF K₁ ← BNF.initHeuristic K₁ f
   IO.println (bnfH.assumptionStatement)
   -- → [注意] この結果は GRH より強いヒューリスティック...
   IO.println s!"h = {bnfH.classNumber}"  -- h = 3
 
   -- GRH 条件付き
-  let bnfG ← BNF.initGRH f
+  let bnfG : BNF K₁ ← BNF.initGRH K₁ f
   IO.println (bnfG.assumptionStatement)
   -- → [GRH 条件付き] この結果は一般 Riemann 予想を仮定し...
 
   -- 無条件（虚二次体は次数 2 なので bnfcertify が実用的）
-  let bnfU? ← BNF.initUnconditional f
+  let bnfU? : Option (BNF K₁) ← BNF.initUnconditional K₁ f
   match bnfU? with
   | some bnfU =>
     IO.println (bnfU.assumptionStatement)
