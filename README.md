@@ -9,7 +9,8 @@ Targets **Lean v4.28.0** and **PARI 2.13.x**.
 - Wraps PARI's `GEN` type as a Lean `opaque` type
 - Exposes `pari_init`, `gp_read_str`, `GENtostr`, `ellinit`, and `ellap` through C FFI bindings
 - Manages PARI's `avma` stack from Lean (mark / restore / gcopy)
-- Demonstrates computing the Frobenius trace $a_p$ of an elliptic curve for a list of primes
+- Provides a **native-type conversion layer** (`LeanPari.Conv`) for `Int`, `Nat`, `List Int`, and `Float` ↔ PARI `GEN`
+- Demonstrates computing the Frobenius trace $a_p$ of an elliptic curve using Lean-native types (no string encoding required)
 
 ## Prerequisites
 
@@ -33,16 +34,20 @@ Or build from source and install to a custom prefix (e.g. `~/`).
 lean-pari/
 ├── lean-toolchain          # pins Lean v4.28.0
 ├── lakefile.toml           # lake build config
-├── Makefile                # compiles c/pari_lean.o, then runs lake build
+├── Makefile                # compiles C objects, then runs lake build
 ├── c/
-│   └── pari_lean.c         # C glue code between Lean and PARI
+│   ├── pari_lean_internal.h   # shared helpers (gen_to_lean, lean_to_gen)
+│   ├── pari_lean.c            # core FFI: init, stack, readStr, toStr, type conversions
+│   └── pari_ell_lean.c        # elliptic-curve FFI: ellinit, ellap
 ├── LeanPari/
 │   ├── Types.lean          # opaque GEN type
 │   ├── Basic.lean          # FFI bindings: init, stack, readStr, toStr
-│   └── Elliptic.lean       # FFI bindings: ellinit, ellap
+│   ├── Conv.lean           # Lean ↔ PARI type conversion layer (issue #5)
+│   └── Elliptic.lean       # FFI bindings: ellinit, ellap; native-type API
 ├── Main.lean               # demo entry point
 └── docs/
-    └── sample-implementation.md   # detailed implementation notes (Japanese)
+    ├── sample-implementation.md          # implementation notes (Japanese)
+    └── plan-issue5-native-type-conversion.md  # design plan for issue #5 (Japanese)
 ```
 
 ## Build
@@ -60,7 +65,8 @@ PARI_LIB     = /path/to/lib       # directory containing libpari.so
 ### 2. Edit `lakefile.toml`
 
 ```toml
-moreLinkArgs = ["-lpari", "-lm", "-L/path/to/lib", "-Wl,-rpath,/path/to/lib", "c/pari_lean.o"]
+moreLinkArgs = ["-lpari", "-lm", "-L/path/to/lib", "-Wl,-rpath,/path/to/lib",
+               "c/pari_lean.o", "c/pari_ell_lean.o"]
 ```
 
 Replace `/path/to/lib` with the directory that contains `libpari.so`.
@@ -123,6 +129,29 @@ def computeEllap (coeffsStr primeStr : String) : IO Int := do
   return ap
 ```
 
+### Native-type conversion layer (`LeanPari.Conv`)
+
+Instead of encoding arguments as GP strings with `gp_read_str`, the `Conv` module converts Lean native types directly to/from PARI `GEN`:
+
+| Direction | Function | Implementation |
+|---|---|---|
+| `Int → GEN` | `intToGen` | `readStr (toString n)` |
+| `Nat → GEN` | `natToGen` | `readStr (toString n)` |
+| `List Int → GEN` | `listIntToGen` | `readStr ("[" ++ ...]` |
+| `Float → GEN` | `floatToGen` | C: `dbltor(f)` |
+| `GEN → Int` | `genToInt` | C: `itos(x)` |
+| `GEN → List Int` | `genToListInt` | C: iterate `gel(v, i)` |
+| `GEN → Float` | `genToFloat` | C: `gtodouble(x)` |
+
+This enables the high-level native API:
+
+```lean
+-- instead of: computeEllap "[0,0,0,0,7]" "101"
+let ap ← Pari.computeEllapNative [0, 0, 0, 0, 7] 101
+```
+
+The string-based `computeEllap` and `ellinit` are retained for backward compatibility.
+
 ### PARI 2.13.x error-handling macros
 
 The old `pari_CATCH { } TRY { } CATCH(e) { e->warning }` syntax is **gone** in PARI 2.13.x. Use:
@@ -154,6 +183,8 @@ pari_CATCH(CATCH_ALL) {
 ### FFI design
 - [x] `initialize` removed; `initializePari` called explicitly in `main`
 - [x] `withStack` used only for `IO GEN`; `IO Int` results use manual stack management
+- [x] Native-type conversion layer in `LeanPari.Conv` (`intToGen`, `listIntToGen`, `genToInt`, etc.)
+- [x] `lean_box_float` / `lean_unbox_float` used for `Float ↔ double` boxing
 
 ## License
 
