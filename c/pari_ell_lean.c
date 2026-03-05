@@ -59,3 +59,23 @@ LEAN_EXPORT lean_obj_res lean_pari_ellap(
     long val = itos(ap);  /* GEN → long（範囲外は PARI がエラー） */
     return lean_io_result_mk_ok(lean_int64_to_int((int64_t)val));
 }
+
+/* ================================================================
+ * 3. ellinit_gen — GEN（t_VEC）を直接受け取る ellinit ラッパー（issue #5）
+ * ================================================================ */
+LEAN_EXPORT lean_obj_res lean_pari_ellinit_gen(
+    b_lean_obj_arg coeffs_obj,
+    lean_obj_arg world)
+{
+    GEN coeffs = lean_to_gen(coeffs_obj);
+    GEN E = NULL;
+    pari_CATCH(CATCH_ALL) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "PARI ellinit error #%ld", err_get_num(__iferr_data));
+        return lean_io_result_mk_error(
+            lean_mk_io_user_error(lean_mk_string(msg)));
+    } pari_TRY {
+        E = ellinit(coeffs, NULL, DEFAULTPREC);
+    } pari_ENDCATCH;
+    return lean_io_result_mk_ok(gen_to_lean(E));
+}
