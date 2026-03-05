@@ -255,6 +255,7 @@ LEAN_EXPORT lean_obj_res lean_pari_bnfinit_coeffs(
 }
 ```
 
+```C
 // 次数
 LEAN_EXPORT lean_obj_res lean_pari_nf_degree(
     b_lean_obj_arg nf_obj, lean_obj_arg world)
@@ -489,3 +490,286 @@ def testBNF : IO Unit := do
 - 判別式・類数は Lean の `Int`（任意精度）にすることで，大きな体でも精度を落とさず扱える．
 - 定義多項式を `Polynomial ℚ`（Mathlib4）なまま `NumberField.pol` として保持することで，小形式判定（`Irreducible`）や階数計算等の Lean 内部証明がそのまま利用できる．
 - `NF ≤ BNF ≤ BNR` の型階層に対応して，将来 `BNR` 構造体を追加する際も `BNF` を `bnr.nf` フィールドとして持てばよく，拡張性がある．
+
+## mathlibとの統合の検討
+
+PARI の `bnfinit()` はGRHや，それよりも強いE. Bachの上界を仮定した計算がデフォルトの挙動である．このことを踏まえて，Lean 4 との統合設計に反映させる．
+
+***
+
+## `bnfinit()` の仮定の正確な内容
+
+PARI のドキュメントと実装を確認すると，仮定は **3 段階**に分かれている ： [pari.math.u-bordeaux](https://pari.math.u-bordeaux.fr/dochtml/html-stable/General_number_fields.html)
+
+| レベル | 内容 | 該当条件 |
+|---|---|---|
+| **Level 0** | Minkowski上界まで全素イデアルを検査 | 無条件に正確（`bnfcertify` 後）|
+| **Level 1** | Bach上界 \(12 \log^2 |d_K|\) 以下の素イデアルで生成 | GRH 条件付きで正確 |
+| **Level 2** | デフォルト上界 \(0.3 \log^2 \|d_K\|\)（通称 "Bach 定数のカンニング"）| **GRH より強いヒューリスティックを仮定** |
+
+デフォルトの `bnfinit(f)` は **Level 2**，すなわち GRH すら仮定していない純粋なヒューリスティックで動作する ．`bnfcertify` を呼ぶことで Level 0（無条件）に格上げできるが，体の次数が大きくなると実行が困難になる ． [pari.math.u-bordeaux](https://pari.math.u-bordeaux.fr/archives/pari-users-0312/msg00020.html)
+
+***
+
+## Lean 4 型設計への反映：`Certification` 型
+
+この前提条件の段階を **Lean の型で明示的に表現**することが，形式化との統合における最重要設計判断である．
+
+```lean
+-- LeanPari/Certification.lean
+namespace LeanPari
+
+/--
+  bnfinit の計算結果の信頼性の段階．
+  PARI の 3 段階の証明レベルを型で表現する．
+-/
+inductive BNFCertification where
+  /-- bnfinit のデフォルト動作．
+      GRH より強いヒューリスティック (Bach 定数 c = 0.3) を仮定．
+      原則として研究計算の出発点・探索用途． -/
+  | Heuristic
+      (bachConst : Float)     -- 使用した Bach 定数（デフォルト 0.3）
+      : BNFCertification
+
+  /-- GRH を仮定した条件付き正確解．
+      Bach 界 12·log²|disc| まで検査済み．
+      定理の statement に「GRH を仮定して」と明記する場合はこれ． -/
+  | ConditionalOnGRH
+      (bound : Nat)           -- 実際に使用した界
+      : BNFCertification
+
+  /-- bnfcertify による無条件証明済み．
+      Minkowski 界まで全素イデアルを検査し，GRH を必要としない． -/
+  | Unconditional
+      (certProof : String)    -- bnfcertify の出力ログ（監査用）
+      : BNFCertification
+
+namespace BNFCertification
+
+def isUnconditional : BNFCertification → Bool
+  | .Unconditional _ => true
+  | _                => false
+
+def isGRHConditional : BNFCertification → Bool
+  | .ConditionalOnGRH _ => true
+  | .Unconditional _    => true   -- 無条件は GRH 条件付きを含意
+  | _                   => false
+
+/-- 研究論文で「証明」として使えるか -/
+def isPublishable (cert : BNFCertification) : Bool :=
+  cert.isGRHConditional  -- GRH 条件付きは明示すれば論文に使える
+
+end BNFCertification
+end LeanPari
+```
+
+***
+
+## `BNF` 構造体に `cert` フィールドを追加
+
+前回設計した `BNF` 構造体を修正する：
+
+```lean
+-- LeanPari/NumberField.lean（修正版）
+
+structure BNF where
+  nf         : NumberField
+  clgp       : ClassGroup
+  tuOrder    : Nat
+  tuGen      : PariGEN
+  fu         : PariGEN
+  regulator  : PariGEN
+  bnfRaw     : PariGEN
+  /-- この BNF の計算が依拠している仮定 -/
+  cert       : BNFCertification
+  /-- bnfinit に渡した技術的パラメータの記録 -/
+  bachConst  : Float    -- デフォルト 0.3，GRH 条件下では 12.0
+  searchBound : Nat     -- 実際に検査した素数の界
+
+namespace BNF
+
+/-- 無条件の結果かどうか -/
+def isUnconditional (b : BNF) : Bool :=
+  b.cert.isUnconditional
+
+/-- この計算結果を定理として使う際の前提条件を文字列で返す -/
+def assumptionStatement (b : BNF) : String :=
+  match b.cert with
+  | .Heuristic c =>
+    s!"[注意] この結果は GRH より強いヒューリスティック \
+       (Bach 定数 {c}) を仮定しています．検証には bnfcertify を使用してください．"
+  | .ConditionalOnGRH bound =>
+    s!"[GRH 条件付き] この結果は一般 Riemann 予想 (GRH) を仮定し，\
+       界 {bound} まで検査済みです．"
+  | .Unconditional _ =>
+    "[無条件] この結果は bnfcertify により無条件に検証済みです．"
+
+end BNF
+```
+
+***
+
+## `Conv.lean` への追加：`polyQQToGen`
+
+`Polynomial ℚ` を PARI の `t_POL` GEN に変換する関数を `Conv.lean` に追加する．
+定数項から最高次係数の順に有理数リストを作り，PARI の `Polrev` 関数に渡す方式で実装できる：
+
+```lean
+-- LeanPari/Conv.lean（追加分）
+import Mathlib.RingTheory.Polynomial.Basic
+
+namespace Pari
+
+open Polynomial in
+/-- `Polynomial ℚ` を PARI `t_POL` GEN に変換する．
+    係数を定数項から最高次の順に並べた有理数リストを PARI の `Polrev` に渡す． -/
+def polyQQToGen (p : Polynomial ℚ) : IO GEN := do
+  let deg := p.natDegree
+  let coeffStrs := (List.range (deg + 1)).map fun i =>
+    let c : ℚ := p.coeff i
+    if c.den = 1 then toString c.num else s!"{c.num}/{c.den}"
+  readStr s!"Polrev([{",".intercalate coeffStrs}])"
+
+end Pari
+```
+
+`Polrev([a₀, a₁, …, aₙ])` は PARI で `a₀ + a₁·x + … + aₙ·xⁿ` を構築する関数であり，
+`Polynomial.coeff p i` で得られる Lean 側の係数の順序と一致する．
+
+***
+
+## `BNF.init` の修正：3 種類のコンストラクタ
+
+引数を `String` から `Polynomial ℚ` に変更し，内部で `Conv.polyQQToGen` を呼んで
+PARI GEN に変換してから `bnfinit` に渡す：
+
+```lean
+-- LeanPari/BNF.lean（修正版）
+
+namespace LeanPari
+
+/-- デフォルト：ヒューリスティック（探索用）-/
+def BNF.initHeuristic (pol : Polynomial ℚ) : IO BNF := do
+  let polGen ← Conv.polyQQToGen pol
+  let bnfRaw ← withPariStack do
+    bnfinit polGen          -- Pari.bnfinit : GEN → IO GEN（flag = 0 デフォルト）
+  let base ← BNF.extractFields bnfRaw
+  return { base with
+    cert       := .Heuristic 0.3
+    bachConst  := 0.3 }
+
+/-- GRH 条件付き：Bach 定数を 12.0 に設定 -/
+def BNF.initGRH (pol : Polynomial ℚ) : IO BNF := do
+  let polGen ← Conv.polyQQToGen pol
+  -- technical パラメータで Bach 定数を 12 に設定
+  let bnfRaw ← withPariStack do
+    bnfinitWithBach polGen 12.0  -- Pari.bnfinitWithBach : GEN → Float → IO GEN
+  let bound ← pariComputeBachBound bnfRaw  -- 12·log²|disc| を計算
+  let base ← BNF.extractFields bnfRaw
+  return { base with
+    cert       := .ConditionalOnGRH bound
+    bachConst  := 12.0 }
+
+/-- 無条件：bnfcertify を呼ぶ（低次体のみ実用的）-/
+def BNF.initUnconditional (pol : Polynomial ℚ) : IO (Option BNF) := do
+  let polGen ← Conv.polyQQToGen pol
+  let bnfRaw ← withPariStack do
+    bnfinitFull polGen      -- Pari.bnfinitFull : GEN → IO GEN（flag = 1，単数も計算）
+  -- bnfcertify を実行
+  let certResult ← pariCallBnfcertify bnfRaw
+  if certResult == 1 then
+    let base ← BNF.extractFields bnfRaw
+    return some { base with
+      cert      := .Unconditional "bnfcertify: 1"
+      bachConst := 0.0 }
+  else
+    return none  -- 証明失敗（体が大きすぎる等）
+
+end LeanPari
+```
+
+`bnfinit`・`bnfinitWithBach`・`bnfinitFull` はそれぞれ `Basic.lean` に FFI 宣言を追加し，
+対応する C ラッパーを `c/pari_lean.c` に実装する（`gp_read_str` を経由しない直接呼び出し）：
+
+```lean
+-- LeanPari/Basic.lean（追加分）
+
+/-- PARI の bnfinit(pol) を呼ぶ（flag = 0 デフォルト） -/
+@[extern "lean_pari_bnfinit"]
+opaque bnfinit (pol : @& GEN) : IO GEN
+
+/-- PARI の bnfinit(pol, , [0,0,0.5,bachC]) を呼ぶ（GRH 条件付き用） -/
+@[extern "lean_pari_bnfinit_with_bach"]
+opaque bnfinitWithBach (pol : @& GEN) (bachC : Float) : IO GEN
+
+/-- PARI の bnfinit(pol, 1) を呼ぶ（flag = 1，単数群も計算） -/
+@[extern "lean_pari_bnfinit_full"]
+opaque bnfinitFull (pol : @& GEN) : IO GEN
+```
+
+***
+
+## Mathlib との統合における注意
+
+前回提案した `BNFBridge` の整合性命題も，前提条件を明示する形に修正すべきである：
+
+```lean
+structure BNFBridge (K : Type) [Field K] [NumberField K] where
+  bnf : BNF
+  /-- 無条件に成立する命題は Unconditional のみ -/
+  classNumberEq :
+    match bnf.cert with
+    | .Unconditional _    =>
+        -- Lean カーネルが検証可能
+        NumberField.classNumber K = bnf.clgp.classNumber.toNat
+    | .ConditionalOnGRH _ =>
+        -- 定理の statement に GRH を仮定として明記
+        GRH → NumberField.classNumber K = bnf.clgp.classNumber.toNat
+    | .Heuristic _        =>
+        -- 命題自体は立てられるが証明の根拠が弱い
+        -- sorry か native_decide（計算的検証）で補う
+        NumberField.classNumber K = bnf.clgp.classNumber.toNat
+```
+
+***
+
+## 使用例と出力
+
+```lean
+open Polynomial in
+def checkQ_sqrt_neg23 : IO Unit := do
+  pariInit 8000000 10000
+
+  -- 定義多項式を Lean の Polynomial ℚ として記述（文字列リテラル不使用）
+  let f : Polynomial ℚ := X ^ 2 + C 23  -- ℚ[x] の x² + 23
+
+  -- 探索：ヒューリスティック
+  let bnfH ← BNF.initHeuristic f
+  IO.println (bnfH.assumptionStatement)
+  -- → [注意] この結果は GRH より強いヒューリスティック...
+  IO.println s!"h = {bnfH.classNumber}"  -- h = 3
+
+  -- GRH 条件付き
+  let bnfG ← BNF.initGRH f
+  IO.println (bnfG.assumptionStatement)
+  -- → [GRH 条件付き] この結果は一般 Riemann 予想を仮定し...
+
+  -- 無条件（虚二次体は次数 2 なので bnfcertify が実用的）
+  let bnfU? ← BNF.initUnconditional f
+  match bnfU? with
+  | some bnfU =>
+    IO.println (bnfU.assumptionStatement)
+    -- → [無条件] この結果は bnfcertify により無条件に検証済みです．
+  | none =>
+    IO.println "bnfcertify 失敗"
+```
+
+***
+
+## まとめ
+
+PARI の `bnfinit()` の前提条件の階層を Lean 4 の型として明示することには，以下の研究上の利点がある ： [arxiv](https://www.arxiv.org/pdf/2510.05501.pdf)
+
+- `BNFCertification` 型が「どの仮定の下で計算したか」を値レベルで記録するため，**証明の再現性と透明性が確保**される
+- Mathlib との統合において，GRH を `Prop` として明示的に前提にする命題と，無条件命題を**型レベルで区別**できる
+- 岩澤理論の研究では，λ-不変量・μ-不変量の計算は現実的には GRH 条件付きで行わざるを得ないが，その事実を**形式的に記録**することが論文の厳密性を保証する [londmathsoc.onlinelibrary.wiley](https://londmathsoc.onlinelibrary.wiley.com/doi/full/10.1112/jlms.12563)
