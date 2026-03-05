@@ -1,5 +1,5 @@
 -- LeanPari/Elliptic.lean
-import LeanPari.Basic
+import LeanPari.Conv
 
 namespace Pari
 
@@ -18,6 +18,24 @@ def computeEllap (coeffsStr : String) (primeStr : String) : IO Int := do
   let E ← ellinit coeffsStr
   let p ← readStr primeStr
   let result ← ellap E p
+  stackRestore mark
+  return result
+
+-- ---------------------------------------------------------------
+-- ネイティブ型 API（issue #5）
+-- ---------------------------------------------------------------
+
+/-- ellinit の GEN 直接受け取り版：`listIntToGen` で変換した係数 GEN をそのまま渡せる -/
+@[extern "lean_pari_ellinit_gen"]
+opaque ellinitGen (coeffs : @& GEN) : IO GEN
+
+/-- ネイティブ API：`List Int` の係数と `Int` の素数を受け取って a_p を返す -/
+def computeEllapNative (coeffs : List Int) (p : Int) : IO Int := do
+  let mark    ← stackMark
+  let coeffsG ← listIntToGen coeffs   -- List Int → t_VEC
+  let E       ← ellinitGen coeffsG    -- t_VEC → 楕円曲線 GEN
+  let pG      ← intToGen p            -- Int → t_INT
+  let result  ← ellap E pG
   stackRestore mark
   return result
 
